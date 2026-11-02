@@ -2,7 +2,7 @@ from django.contrib import admin
 from .models import (
     RequirementDocument, RequirementAnalysis, BusinessRequirement,
     GeneratedTestCase, AnalysisTask, AIModelConfig, PromptConfig,
-    GenerationConfig, TestCaseGenerationTask
+    GenerationConfig, TestCaseGenerationTask, TestCaseRevision
 )
 
 
@@ -93,7 +93,18 @@ class GenerationConfigAdmin(admin.ModelAdmin):
 
 @admin.register(TestCaseGenerationTask)
 class TestCaseGenerationTaskAdmin(admin.ModelAdmin):
-    list_display = ['task_id', 'title', 'status', 'progress', 'output_mode', 'created_at']
+    list_display = ['task_id', 'title', 'status', 'progress', 'output_mode', 'current_round',
+                    'latest_score', 'created_at']
     list_filter = ['status', 'output_mode', 'created_at']
     search_fields = ['task_id', 'title', 'requirement_text']
     readonly_fields = ['task_id', 'created_at', 'updated_at']
+
+
+@admin.register(TestCaseRevision)
+class TestCaseRevisionAdmin(admin.ModelAdmin):
+    """评审驱动修订轮次"""
+    list_display = ['task', 'round', 'status', 'source', 'score_before', 'score_after',
+                    'retry_count', 'duration_ms', 'created_at']
+    list_filter = ['status', 'source', 'created_at']
+    search_fields = ['task__task_id', 'task__title', 'error_message']
+    readonly_fields = ['created_at', 'completed_at', 'validation_result']

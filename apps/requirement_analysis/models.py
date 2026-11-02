@@ -349,6 +349,9 @@ class TestCaseGenerationTask(models.Model):
         ('complete', '完整输出'),
     ]
 
+    # 评审后修订的最大轮次，超过后需人工介入，避免无休止消耗 token
+    MAX_ROUNDS = 3
+
     task_id = models.CharField(max_length=50, unique=True, verbose_name='任务ID')
     title = models.CharField(max_length=200, verbose_name='任务标题')
     requirement_text = models.TextField(verbose_name='需求描述')
@@ -404,6 +407,10 @@ class TestCaseGenerationTask(models.Model):
     review_feedback = models.TextField(blank=True, verbose_name='评审反馈')
     final_test_cases = models.TextField(blank=True, verbose_name='最终测试用例')
 
+    # 评审后修订（手动触发的多轮修订）
+    current_round = models.PositiveIntegerField(default=0, verbose_name='当前修订轮次')
+    latest_score = models.SmallIntegerField(null=True, blank=True, verbose_name='最新质量评分')
+
     # 元数据
     generation_log = models.TextField(blank=True, verbose_name='生成日志')
     error_message = models.TextField(blank=True, verbose_name='错误信息')
@@ -422,6 +429,83 @@ class TestCaseGenerationTask(models.Model):
 
     def __str__(self):
         return f"{self.title} - {self.get_status_display()}"
+
+
+class TestCaseRevision(models.Model):
+    """
+    用例修订轮次
+
+    每次「评审后重新生成」产生一条记录，保留输入/输出快照与校验结果，
+    使修订过程可追溯、可回滚、可对比分数。
+    """
+    STATUS_CHOICES = [
+        ('pending', '等待中'),
+        ('generating', '生成中'),
+        ('validating', '校验中'),
+        ('reviewing', '评审中'),
+        ('completed', '已完成'),
+        ('needs_manual', '校验未通过'),
+        ('failed', '失败'),
+        ('cancelled', '已取消'),
+    ]
+
+    SOURCE_CHOICES = [
+        ('review', '评审驱动'),
+        ('manual', '人工指定'),
+        ('retry', '校验重试'),
+    ]
+
+    task = models.ForeignKey(
+        TestCaseGenerationTask, on_delete=models.CASCADE,
+        related_name='revisions', verbose_name='所属任务'
+    )
+    round = models.PositiveIntegerField(default=1, verbose_name='轮次')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending', verbose_name='状态')
+    source = models.CharField(max_length=16, choices=SOURCE_CHOICES, default='review', verbose_name='触发来源')
+
+    # 输入快照
+    input_cases = models.TextField(blank=True, verbose_name='本轮输入用例表')
+    review_feedback = models.TextField(blank=True, verbose_name='本轮使用的评审意见')
+    target_issues = models.JSONField(default=list, blank=True, verbose_name='选中的问题编号')
+
+    # 输出
+    output_cases = models.TextField(blank=True, verbose_name='修订后用例表')
+    validation_result = models.JSONField(default=dict, blank=True, verbose_name='结构校验结果')
+
+    # 质量对比
+    score_before = models.SmallIntegerField(null=True, blank=True, verbose_name='修订前评分')
+    score_after = models.SmallIntegerField(null=True, blank=True, verbose_name='修订后评分')
+    review_feedback_after = models.TextField(blank=True, verbose_name='修订后评审意见')
+
+    # 运行信息
+    retry_count = models.PositiveSmallIntegerField(default=0, verbose_name='校验重试次数')
+    writer_model_config = models.ForeignKey(
+        AIModelConfig, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='revision_tasks', verbose_name='编写模型配置'
+    )
+    writer_prompt_config = models.ForeignKey(
+        PromptConfig, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='revision_tasks', verbose_name='编写提示词配置'
+    )
+    progress = models.IntegerField(default=0, verbose_name='进度百分比')
+    phase = models.CharField(max_length=20, blank=True, verbose_name='当前阶段')
+    error_message = models.TextField(blank=True, verbose_name='错误信息')
+    duration_ms = models.IntegerField(default=0, verbose_name='耗时(毫秒)')
+    created_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, verbose_name='操作人'
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    completed_at = models.DateTimeField(null=True, blank=True, verbose_name='完成时间')
+
+    class Meta:
+        db_table = 'testcase_generation_revision'
+        verbose_name = '用例修订轮次'
+        verbose_name_plural = '用例修订轮次'
+        ordering = ['round']
+        unique_together = ('task', 'round')
+
+    def __str__(self):
+        return f"{self.task.task_id} - 第{self.round}轮修订（{self.get_status_display()}）"
 
 
 class AIModelService:

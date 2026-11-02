@@ -2,7 +2,7 @@ from rest_framework import serializers
 from .models import (
     RequirementDocument, RequirementAnalysis, BusinessRequirement,
     GeneratedTestCase, AnalysisTask, AIModelConfig, PromptConfig, TestCaseGenerationTask,
-    GenerationConfig
+    GenerationConfig, TestCaseRevision
 )
 
 
@@ -261,10 +261,12 @@ class TestCaseGenerationTaskSerializer(serializers.ModelSerializer):
                  'reviewer_model_config', 'reviewer_model_name', 'writer_prompt_config', 'writer_prompt_name',
                  'reviewer_prompt_config', 'reviewer_prompt_name', 'generated_test_cases',
                  'review_feedback', 'final_test_cases', 'generation_log', 'error_message',
+                 'current_round', 'latest_score',
                  'created_by', 'created_by_name', 'created_at', 'updated_at', 'completed_at']
         read_only_fields = ['task_id', 'status', 'progress', 'generated_test_cases', 
                           'review_feedback', 'final_test_cases', 'generation_log', 
-                          'error_message', 'created_by', 'completed_at']
+                          'error_message', 'current_round', 'latest_score',
+                          'created_by', 'completed_at']
     
     def create(self, validated_data):
         # 自动设置创建者和任务ID
@@ -304,3 +306,63 @@ class GenerationConfigSerializer(serializers.ModelSerializer):
             'is_active', 'created_at', 'updated_at'
         ]
         read_only_fields = ['created_at', 'updated_at']
+
+
+class TestCaseRevisionSerializer(serializers.ModelSerializer):
+    """修订轮次序列化器（列表用，不含大文本字段）"""
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+    source_display = serializers.CharField(source='get_source_display', read_only=True)
+    created_by_name = serializers.CharField(source='created_by.username', read_only=True)
+    writer_model_name = serializers.CharField(source='writer_model_config.name', read_only=True)
+    score_delta = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TestCaseRevision
+        fields = [
+            'id', 'task', 'round', 'status', 'status_display', 'source', 'source_display',
+            'target_issues', 'validation_result', 'score_before', 'score_after', 'score_delta',
+            'retry_count', 'progress', 'phase', 'error_message', 'duration_ms',
+            'created_by', 'created_by_name', 'writer_model_name',
+            'created_at', 'completed_at',
+        ]
+        read_only_fields = fields
+
+    def get_score_delta(self, obj):
+        if obj.score_before is None or obj.score_after is None:
+            return None
+        return obj.score_after - obj.score_before
+
+
+class TestCaseRevisionDetailSerializer(TestCaseRevisionSerializer):
+    """修订轮次详情（含输入/输出用例全文）"""
+
+    class Meta(TestCaseRevisionSerializer.Meta):
+        fields = TestCaseRevisionSerializer.Meta.fields + [
+            'input_cases', 'output_cases', 'review_feedback', 'review_feedback_after',
+        ]
+        read_only_fields = fields
+
+
+class RegenerateRequestSerializer(serializers.Serializer):
+    """评审后重新生成用例的请求参数"""
+    target_issues = serializers.ListField(
+        child=serializers.CharField(max_length=16), required=False, default=list,
+        help_text='要修复的评审问题编号，如 ["Q1","Q3"]；为空则自动挑选阻断级问题'
+    )
+    scope = serializers.ChoiceField(
+        choices=['blocking', 'all'], default='blocking',
+        help_text='blocking=只修阻断级问题；all=全量重写'
+    )
+    writer_model_config = serializers.IntegerField(
+        required=False, allow_null=True, help_text='不传则沿用任务的编写模型'
+    )
+    writer_prompt_config = serializers.IntegerField(
+        required=False, allow_null=True, help_text='不传则沿用任务的编写提示词'
+    )
+    auto_review = serializers.BooleanField(default=True, help_text='修订完成后是否自动复评')
+    max_retry = serializers.IntegerField(
+        min_value=0, max_value=2, default=1, help_text='结构校验失败后的自动重试次数'
+    )
+    guidance = serializers.CharField(
+        required=False, allow_blank=True, default='', help_text='人工补充要求，拼入修订指令'
+    )

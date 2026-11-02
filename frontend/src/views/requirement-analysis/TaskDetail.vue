@@ -55,6 +55,117 @@
     </div>
 
     <div v-else class="task-content">
+      <!-- 评审后重新生成（评审驱动修订） -->
+      <div class="revision-panel" v-if="reviewInfoLoaded">
+        <div class="revision-panel-header">
+          <div class="revision-panel-title">
+            <span class="panel-name">{{ $t('taskDetail.revision.panelTitle') }}</span>
+            <span class="score-badge" v-if="reviewInfo.score !== null">
+              {{ $t('taskDetail.revision.scoreBadge', { score: reviewInfo.score }) }}
+            </span>
+            <span
+              v-if="reviewInfo.structure && reviewInfo.structure.passed !== null"
+              class="structure-badge"
+              :class="reviewInfo.structure.passed ? 'ok' : 'bad'">
+              {{
+                reviewInfo.structure.passed
+                  ? $t('taskDetail.revision.structureOk')
+                  : $t('taskDetail.revision.structureBad', { count: structureErrors.length })
+              }}
+            </span>
+          </div>
+          <div class="round-info" v-if="reviewInfo.current_round > 0">
+            {{ $t('taskDetail.revision.roundInfo', { round: reviewInfo.current_round, max: reviewInfo.max_rounds }) }}
+          </div>
+        </div>
+
+        <!-- 修订进行中 -->
+        <div class="revision-running" v-if="activeRevision">
+          <div class="running-line">
+            <span class="phase-text">{{ phaseText }}</span>
+            <span class="progress-text">{{ activeRevision.progress }}%</span>
+          </div>
+          <div class="progress-bar">
+            <div class="progress-inner" :style="{ width: (activeRevision.progress || 0) + '%' }"></div>
+          </div>
+          <div class="running-hint">{{ $t('taskDetail.revision.runningHint') }}</div>
+        </div>
+
+        <template v-else>
+          <!-- 评审问题清单 -->
+          <div class="issue-list" v-if="reviewInfo.issues && reviewInfo.issues.length">
+            <div class="issue-list-title">
+              {{ $t('taskDetail.revision.issueListTitle', { count: reviewInfo.issues.length }) }}
+            </div>
+            <label class="issue-item" v-for="issue in reviewInfo.issues" :key="issue.issue_id">
+              <input type="checkbox" :value="issue.issue_id" v-model="selectedIssues" />
+              <span class="issue-id">{{ issue.issue_id }}</span>
+              <span class="issue-severity" :class="severityClass(issue.severity)" v-if="issue.severity">
+                {{ issue.severity }}
+              </span>
+              <span class="issue-title">{{ issue.title }}</span>
+              <span class="issue-target" v-if="issue.target">{{ issue.target }}</span>
+            </label>
+          </div>
+
+          <!-- 结构校验问题 -->
+          <div class="structure-errors" v-if="structureErrors.length">
+            <div class="structure-errors-title" @click="showStructureErrors = !showStructureErrors">
+              <span>{{ $t('taskDetail.revision.structureErrorTitle', { count: structureErrors.length }) }}</span>
+              <span class="toggle">{{ showStructureErrors ? '−' : '+' }}</span>
+            </div>
+            <ul v-if="showStructureErrors">
+              <li v-for="(err, index) in structureErrors.slice(0, 60)" :key="index">
+                <span class="err-rule">{{ err.rule }}</span>
+                <span class="err-row" v-if="err.row !== null && err.row !== undefined">
+                  {{ $t('taskDetail.revision.rowLabel', { row: err.row }) }}
+                </span>
+                <span class="err-case" v-if="err.case_id">{{ err.case_id }}</span>
+                <span class="err-msg">{{ err.message }}</span>
+              </li>
+            </ul>
+          </div>
+
+          <!-- 操作区 -->
+          <div class="revision-actions">
+            <button
+              class="regen-selected-btn"
+              :disabled="!canRegenerate || selectedIssues.length === 0"
+              @click="startRegenerate(false)">
+              {{ $t('taskDetail.revision.regenerateSelected', { count: selectedIssues.length }) }}
+            </button>
+            <button
+              class="regen-all-btn"
+              :disabled="!canRegenerate"
+              @click="startRegenerate(true)">
+              {{ $t('taskDetail.revision.regenerateAll') }}
+            </button>
+            <span class="blocked-hint" v-if="reviewInfo.blocked_reason">{{ reviewInfo.blocked_reason }}</span>
+          </div>
+
+          <!-- 轮次历史 -->
+          <div class="revision-history" v-if="revisions.length">
+            <div class="history-title">{{ $t('taskDetail.revision.historyTitle') }}</div>
+            <div class="history-item" v-for="item in revisions" :key="item.id">
+              <span class="history-round">v{{ item.round }}</span>
+              <span class="history-status" :class="item.status">{{ item.status_display }}</span>
+              <span class="history-score" v-if="item.score_before !== null || item.score_after !== null">
+                {{ item.score_before !== null ? item.score_before : '—' }}
+                →
+                {{ item.score_after !== null ? item.score_after : '—' }}
+              </span>
+              <span class="history-retry" v-if="item.retry_count > 0">
+                {{ $t('taskDetail.revision.retryTimes', { count: item.retry_count }) }}
+              </span>
+              <span class="history-error" v-if="item.error_message">{{ item.error_message }}</span>
+              <button class="history-rollback" @click="rollbackRound(item.round)">
+                {{ $t('taskDetail.revision.rollback') }}
+              </button>
+            </div>
+          </div>
+        </template>
+      </div>
+
       <!-- 批量操作区域 -->
       <div class="batch-actions" v-if="testCases.length > 0">
         <div class="selection-info">
@@ -284,7 +395,25 @@ export default {
         steps: '',
         expected: '',
         priority: 'P2'
-      }
+      },
+      // 评审驱动修订相关状态
+      reviewInfoLoaded: false,
+      reviewInfo: {
+        score: null,
+        issues: [],
+        structure: null,
+        current_round: 0,
+        max_rounds: 3,
+        can_regenerate: false,
+        blocked_reason: '',
+        suggested_issues: []
+      },
+      selectedIssues: [],
+      showStructureErrors: false,
+      revisions: [],
+      activeRevision: null,
+      revisionTimer: null,
+      isRegenerating: false
     }
   },
 
@@ -309,12 +438,41 @@ export default {
 
     paginationEnd() {
       return Math.min(this.currentPage * this.pageSize, this.testCases.length)
+    },
+
+    // 结构校验的 error 级问题（warning 不计入）
+    structureErrors() {
+      const structure = this.reviewInfo.structure
+      if (!structure || !Array.isArray(structure.errors)) return []
+      return structure.errors.filter(e => e.severity === 'error')
+    },
+
+    canRegenerate() {
+      return !!this.reviewInfo.can_regenerate && !this.activeRevision && !this.isRegenerating
+    },
+
+    // 当前修订阶段的中文描述
+    phaseText() {
+      const phase = this.activeRevision && this.activeRevision.phase
+      const map = {
+        generating: this.$t('taskDetail.revision.phaseGenerating'),
+        validating: this.$t('taskDetail.revision.phaseValidating'),
+        retrying: this.$t('taskDetail.revision.phaseRetrying'),
+        reviewing: this.$t('taskDetail.revision.phaseReviewing')
+      }
+      return map[phase] || this.$t('taskDetail.revision.phaseGenerating')
     }
   },
 
   mounted() {
     this.taskId = this.$route.params.taskId
     this.loadTaskDetail()
+    this.loadReviewInfo()
+    this.loadRevisions()
+  },
+
+  beforeUnmount() {
+    this.stopRevisionPolling()
   },
 
   methods: {
@@ -357,6 +515,169 @@ export default {
       } finally {
         this.isLoading = false
       }
+    },
+
+    // ==================== 评审驱动修订 ====================
+
+    // 加载评审问题清单与结构校验结果
+    async loadReviewInfo() {
+      try {
+        const res = await api.get(`/requirement-analysis/testcase-generation/${this.taskId}/review-issues/`)
+        this.reviewInfo = res.data
+        // 默认勾选阻断级问题
+        const suggested = res.data.suggested_issues || []
+        this.selectedIssues = suggested.length
+          ? suggested
+          : (res.data.issues || []).map(i => i.issue_id).slice(0, 3)
+        this.reviewInfoLoaded = true
+      } catch (error) {
+        console.error('加载评审信息失败:', error)
+        this.reviewInfoLoaded = false
+      }
+    },
+
+    // 加载修订轮次历史，并恢复未结束轮次的轮询
+    async loadRevisions() {
+      try {
+        const res = await api.get(`/requirement-analysis/testcase-generation/${this.taskId}/revisions/`)
+        this.revisions = res.data.rounds || []
+        const active = this.revisions.find(r =>
+          ['pending', 'generating', 'validating', 'reviewing'].includes(r.status))
+        if (active && !this.revisionTimer) {
+          this.activeRevision = active
+          this.startRevisionPolling(active.round)
+        }
+      } catch (error) {
+        console.error('加载修订历史失败:', error)
+      }
+    },
+
+    // 发起修订：isFull=true 表示全量重写，否则按勾选的问题定向修复
+    async startRegenerate(isFull) {
+      if (!this.canRegenerate) return
+
+      const targetIssues = isFull ? [] : [...this.selectedIssues]
+      if (!isFull && targetIssues.length === 0) {
+        ElMessage.warning(this.$t('taskDetail.revision.selectIssueFirst'))
+        return
+      }
+
+      try {
+        await ElMessageBox.confirm(
+          isFull
+            ? this.$t('taskDetail.revision.confirmAll')
+            : this.$t('taskDetail.revision.confirmSelected', { count: targetIssues.length }),
+          this.$t('taskDetail.revision.confirmTitle'),
+          {
+            confirmButtonText: this.$t('taskDetail.revision.confirmOk'),
+            cancelButtonText: this.$t('taskDetail.revision.confirmCancel'),
+            type: 'warning'
+          }
+        )
+      } catch (e) {
+        return
+      }
+
+      this.isRegenerating = true
+      try {
+        const res = await api.post(
+          `/requirement-analysis/testcase-generation/${this.taskId}/regenerate/`,
+          {
+            target_issues: targetIssues,
+            scope: isFull ? 'all' : 'blocking',
+            auto_review: true,
+            max_retry: 1
+          }
+        )
+        const round = res.data.round
+        ElMessage.success(this.$t('taskDetail.revision.started', { round }))
+        this.activeRevision = { round, status: 'pending', phase: 'generating', progress: 0 }
+        this.startRevisionPolling(round)
+      } catch (error) {
+        const data = error.response && error.response.data
+        ElMessage.error(
+          (data && (data.error || data.detail)) || this.$t('taskDetail.revision.startFailed')
+        )
+      } finally {
+        this.isRegenerating = false
+      }
+    },
+
+    startRevisionPolling(round) {
+      this.stopRevisionPolling()
+      this.revisionTimer = setInterval(() => this.pollRevisionProgress(round), 2000)
+    },
+
+    stopRevisionPolling() {
+      if (this.revisionTimer) {
+        clearInterval(this.revisionTimer)
+        this.revisionTimer = null
+      }
+    },
+
+    async pollRevisionProgress(round) {
+      try {
+        const res = await api.get(
+          `/requirement-analysis/testcase-generation/${this.taskId}/revisions/${round}/progress/`
+        )
+        this.activeRevision = res.data
+
+        if (res.data.finished) {
+          this.stopRevisionPolling()
+          this.activeRevision = null
+          const { status, error_message: errorMessage, validation_result: validation } = res.data
+
+          if (status === 'completed') {
+            ElMessage.success(this.$t('taskDetail.revision.completed'))
+          } else if (status === 'needs_manual') {
+            const count = (validation && validation.stats && validation.stats.error_count) || 0
+            ElMessage.warning(this.$t('taskDetail.revision.needsManual', { count }))
+          } else {
+            ElMessage.error(errorMessage || this.$t('taskDetail.revision.failed'))
+          }
+
+          await this.loadTaskDetail()
+          await this.loadReviewInfo()
+          await this.loadRevisions()
+        }
+      } catch (error) {
+        console.error('轮询修订进度失败:', error)
+      }
+    },
+
+    async rollbackRound(round) {
+      try {
+        await ElMessageBox.confirm(
+          this.$t('taskDetail.revision.confirmRollback', { round }),
+          this.$t('taskDetail.revision.confirmTitle'),
+          {
+            confirmButtonText: this.$t('taskDetail.revision.confirmOk'),
+            cancelButtonText: this.$t('taskDetail.revision.confirmCancel'),
+            type: 'warning'
+          }
+        )
+      } catch (e) {
+        return
+      }
+
+      try {
+        await api.post(
+          `/requirement-analysis/testcase-generation/${this.taskId}/revisions/${round}/rollback/`
+        )
+        ElMessage.success(this.$t('taskDetail.revision.rollbackDone', { round }))
+        await this.loadTaskDetail()
+        await this.loadReviewInfo()
+        await this.loadRevisions()
+      } catch (error) {
+        const data = error.response && error.response.data
+        ElMessage.error((data && data.error) || this.$t('taskDetail.revision.rollbackFailed'))
+      }
+    },
+
+    severityClass(severity) {
+      if (severity === '阻断级') return 'blocking'
+      if (severity === '严重') return 'serious'
+      return 'suggestion'
     },
 
     parseTestCases(content) {
@@ -1593,5 +1914,339 @@ export default {
 
 .requirement-description-card .el-collapse-item__header .el-icon-arrow-left {
   display: none !important;
+}
+</style>
+
+<style scoped>
+/* ==================== 评审驱动修订面板 ==================== */
+.revision-panel {
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 16px 18px;
+  margin-bottom: 18px;
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
+}
+
+.revision-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.revision-panel-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.panel-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: #111827;
+}
+
+.score-badge {
+  padding: 2px 10px;
+  border-radius: 999px;
+  background: #eff6ff;
+  color: #1d4ed8;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.structure-badge {
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.structure-badge.ok {
+  background: #ecfdf5;
+  color: #047857;
+}
+
+.structure-badge.bad {
+  background: #fef2f2;
+  color: #b91c1c;
+}
+
+.round-info {
+  font-size: 12px;
+  color: #6b7280;
+}
+
+/* 进行中 */
+.revision-running {
+  margin-top: 14px;
+  padding: 12px 14px;
+  background: #f9fafb;
+  border-radius: 8px;
+}
+
+.running-line {
+  display: flex;
+  justify-content: space-between;
+  font-size: 13px;
+  color: #374151;
+  margin-bottom: 8px;
+}
+
+.phase-text {
+  font-weight: 500;
+}
+
+.progress-bar {
+  height: 6px;
+  background: #e5e7eb;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.progress-inner {
+  height: 100%;
+  background: linear-gradient(90deg, #3b82f6, #6366f1);
+  border-radius: 999px;
+  transition: width 0.4s ease;
+}
+
+.running-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #6b7280;
+}
+
+/* 问题清单 */
+.issue-list {
+  margin-top: 14px;
+}
+
+.issue-list-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #374151;
+  margin-bottom: 8px;
+}
+
+.issue-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  margin-bottom: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.issue-item:hover {
+  background: #f9fafb;
+  border-color: #d1d5db;
+}
+
+.issue-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 600;
+  color: #1f2937;
+  min-width: 28px;
+}
+
+.issue-severity {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+
+.issue-severity.blocking {
+  background: #fef2f2;
+  color: #b91c1c;
+}
+
+.issue-severity.serious {
+  background: #fffbeb;
+  color: #b45309;
+}
+
+.issue-severity.suggestion {
+  background: #f3f4f6;
+  color: #4b5563;
+}
+
+.issue-title {
+  color: #111827;
+}
+
+.issue-target {
+  color: #6b7280;
+  font-size: 12px;
+  margin-left: auto;
+}
+
+/* 结构校验问题 */
+.structure-errors {
+  margin-top: 12px;
+  border: 1px solid #fde68a;
+  background: #fffbeb;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.structure-errors-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 13px;
+  font-weight: 600;
+  color: #92400e;
+  cursor: pointer;
+}
+
+.structure-errors ul {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.structure-errors li {
+  font-size: 12px;
+  color: #78350f;
+  line-height: 1.8;
+}
+
+.err-rule {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 600;
+  margin-right: 6px;
+}
+
+.err-row,
+.err-case {
+  margin-right: 6px;
+  color: #a16207;
+}
+
+/* 操作区 */
+.revision-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+  flex-wrap: wrap;
+}
+
+.regen-selected-btn,
+.regen-all-btn {
+  padding: 7px 16px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: all 0.15s ease;
+}
+
+.regen-selected-btn {
+  background: #2563eb;
+  color: #ffffff;
+}
+
+.regen-selected-btn:hover:not(:disabled) {
+  background: #1d4ed8;
+}
+
+.regen-all-btn {
+  background: #ffffff;
+  color: #374151;
+  border-color: #d1d5db;
+}
+
+.regen-all-btn:hover:not(:disabled) {
+  background: #f9fafb;
+  border-color: #9ca3af;
+}
+
+.regen-selected-btn:disabled,
+.regen-all-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.blocked-hint {
+  font-size: 12px;
+  color: #b45309;
+}
+
+/* 轮次历史 */
+.revision-history {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px dashed #e5e7eb;
+}
+
+.history-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #374151;
+  margin-bottom: 8px;
+}
+
+.history-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  padding: 6px 0;
+  flex-wrap: wrap;
+}
+
+.history-round {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 600;
+  color: #1f2937;
+}
+
+.history-status.completed {
+  color: #047857;
+}
+
+.history-status.needs_manual,
+.history-status.failed {
+  color: #b91c1c;
+}
+
+.history-score {
+  color: #1d4ed8;
+  font-weight: 600;
+}
+
+.history-retry {
+  color: #b45309;
+}
+
+.history-error {
+  color: #6b7280;
+  flex: 1 1 100%;
+}
+
+.history-rollback {
+  margin-left: auto;
+  background: none;
+  border: 1px solid #d1d5db;
+  border-radius: 5px;
+  padding: 3px 10px;
+  font-size: 12px;
+  color: #374151;
+  cursor: pointer;
+}
+
+.history-rollback:hover {
+  background: #f3f4f6;
 }
 </style>

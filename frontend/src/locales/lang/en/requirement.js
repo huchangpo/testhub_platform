@@ -613,7 +613,43 @@ export default {
 
     // Excel Export
     excelSheetName: 'Test Cases',
-    excelFileName: 'TestCases_{taskId}_{date}.xlsx'
+    excelFileName: 'TestCases_{taskId}_{date}.xlsx',
+
+    // Review-driven revision
+    revision: {
+      panelTitle: '🔁 Regenerate after review',
+      scoreBadge: 'Score {score}',
+      structureOk: 'Table structure OK',
+      structureBad: '{count} structure issue(s)',
+      roundInfo: 'Revision {round} of {max}',
+      runningHint: 'Revision in progress. The case table below will refresh automatically.',
+      issueListTitle: 'Review issues (select the ones to fix, {count} total)',
+      structureErrorTitle: '{count} formatting issue(s) in the current table (will be fixed together)',
+      rowLabel: 'Row {row}',
+      regenerateSelected: 'Fix selected issues ({count})',
+      regenerateAll: 'Rewrite from full review',
+      historyTitle: 'Revision rounds',
+      retryTimes: 'structure retry x{count}',
+      rollback: 'Rollback',
+      phaseGenerating: 'Calling the model to revise…',
+      phaseValidating: 'Validating table structure…',
+      phaseRetrying: 'Structure check failed, regenerating…',
+      phaseReviewing: 'Re-reviewing the result…',
+      selectIssueFirst: 'Please select at least one review issue',
+      confirmTitle: 'Confirm revision',
+      confirmAll: 'The whole case table will be rewritten based on the full review. Continue?',
+      confirmSelected: 'Regenerate the case table to fix {count} selected issue(s). Continue?',
+      confirmOk: 'Start',
+      confirmCancel: 'Cancel',
+      started: 'Revision round {round} started',
+      startFailed: 'Failed to start revision',
+      completed: 'Revision completed, case table updated',
+      needsManual: 'Still {count} structure issue(s) left. The previous version was kept for manual fixing.',
+      failed: 'Revision failed',
+      confirmRollback: 'Roll back to the version before round {round}?',
+      rollbackDone: 'Rolled back to the version before round {round}',
+      rollbackFailed: 'Rollback failed'
+    }
   },
 
   // Configuration Guide Modal

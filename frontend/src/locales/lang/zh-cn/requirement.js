@@ -613,7 +613,43 @@ export default {
 
     // Excel 导出
     excelSheetName: '测试用例',
-    excelFileName: '测试用例_{taskId}_{date}.xlsx'
+    excelFileName: '测试用例_{taskId}_{date}.xlsx',
+
+    // 评审驱动修订
+    revision: {
+      panelTitle: '🔁 评审后重新生成',
+      scoreBadge: '当前评分 {score}',
+      structureOk: '表格结构正常',
+      structureBad: '结构异常 {count} 处',
+      roundInfo: '已修订 {round} / {max} 轮',
+      runningHint: '修订中，完成后会自动更新下方用例表，无需手动刷新',
+      issueListTitle: '评审问题（勾选要修复的，共 {count} 条）',
+      structureErrorTitle: '当前用例表的格式问题 {count} 项（修订时会一并修复）',
+      rowLabel: '第 {row} 行',
+      regenerateSelected: '按选中问题修订（{count} 项）',
+      regenerateAll: '基于全部评审意见重写',
+      historyTitle: '修订轮次',
+      retryTimes: '结构校验重试 {count} 次',
+      rollback: '回滚',
+      phaseGenerating: '正在调用模型修订…',
+      phaseValidating: '正在校验表格结构…',
+      phaseRetrying: '结构校验未通过，重新生成中…',
+      phaseReviewing: '正在复评修订结果…',
+      selectIssueFirst: '请先勾选至少一个评审问题',
+      confirmTitle: '确认修订',
+      confirmAll: '将基于全部评审意见重写整份用例表，耗时较长，是否继续？',
+      confirmSelected: '将针对选中的 {count} 个问题重新生成用例表，是否继续？',
+      confirmOk: '开始修订',
+      confirmCancel: '取消',
+      started: '第 {round} 轮修订已启动',
+      startFailed: '启动修订失败',
+      completed: '修订完成，用例表已更新',
+      needsManual: '修订结果仍有 {count} 处结构错误，已保留上一版用例，请人工处理',
+      failed: '修订失败',
+      confirmRollback: '确定回滚到第 {round} 轮修订前的版本吗？',
+      rollbackDone: '已回滚到第 {round} 轮修订前的版本',
+      rollbackFailed: '回滚失败'
+    }
   },
 
   // 配置引导弹框

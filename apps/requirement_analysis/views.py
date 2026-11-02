@@ -34,7 +34,7 @@ from django.db import models
 from .models import (
     RequirementDocument, RequirementAnalysis, BusinessRequirement,
     GeneratedTestCase, AnalysisTask, AIModelConfig, PromptConfig, TestCaseGenerationTask,
-    GenerationConfig, AIModelService
+    GenerationConfig, AIModelService, TestCaseRevision
 )
 from .serializers import (
     RequirementDocumentSerializer, RequirementAnalysisSerializer,
@@ -42,8 +42,11 @@ from .serializers import (
     AnalysisTaskSerializer, DocumentUploadSerializer,
     TestCaseGenerationRequestSerializer, TestCaseReviewRequestSerializer,
     AIModelConfigSerializer, PromptConfigSerializer, TestCaseGenerationTaskSerializer,
-    GenerationConfigSerializer
+    GenerationConfigSerializer, TestCaseRevisionSerializer, TestCaseRevisionDetailSerializer,
+    RegenerateRequestSerializer
 )
+from . import revision_service
+from .case_table_validator import extract_issue_blocks, extract_score, validate_case_table
 from .services import RequirementAnalysisService, DocumentProcessor
 
 logger = logging.getLogger(__name__)
@@ -3158,6 +3161,269 @@ class TestCaseGenerationTaskViewSet(viewsets.ModelViewSet):
             'P3': 'low'
         }
         return priority_map.get(priority_str, 'medium')
+
+    # ==================== 评审后修订 ====================
+
+    @action(detail=True, methods=['get'], url_path='review-issues')
+    def review_issues(self, request, task_id=None):
+        """
+        解析评审报告，返回结构化问题清单 + 当前用例表的结构校验结果。
+
+        前端据此渲染可勾选的问题卡片，并展示"这份表到底哪里坏了"。
+        """
+        task = self.get_object()
+        cases_text = task.final_test_cases or task.generated_test_cases or ''
+
+        issues = extract_issue_blocks(task.review_feedback or '')
+        score = task.latest_score if task.latest_score is not None else extract_score(task.review_feedback or '')
+
+        structure = {'passed': None, 'errors': [], 'stats': {}}
+        if cases_text:
+            try:
+                result = validate_case_table(cases_text)
+                structure = {
+                    'passed': result['passed'],
+                    'errors': result['errors'],
+                    'stats': result['stats'],
+                }
+            except Exception as parse_error:
+                logger.warning(f"任务 {task.task_id} 用例表结构校验失败: {parse_error}")
+
+        active = TestCaseRevision.objects.filter(
+            task=task, status__in=['pending', 'generating', 'validating', 'reviewing']
+        ).first()
+
+        blocked_reason = ''
+        if active:
+            blocked_reason = f'第 {active.round} 轮修订正在进行中'
+        elif task.status not in ('completed', 'revising'):
+            blocked_reason = f'任务当前状态为 {task.get_status_display()}，不允许修订'
+        elif (task.current_round or 0) >= TestCaseGenerationTask.MAX_ROUNDS:
+            blocked_reason = f'已达 {TestCaseGenerationTask.MAX_ROUNDS} 轮修订上限，请人工介入'
+        elif not task.review_feedback:
+            blocked_reason = '该任务没有评审意见，无法执行评审驱动修订'
+
+        return Response({
+            'task_id': task.task_id,
+            'score': score,
+            'issues': issues,
+            'structure': structure,
+            'current_round': task.current_round or 0,
+            'max_rounds': TestCaseGenerationTask.MAX_ROUNDS,
+            'has_cases': bool(cases_text),
+            'can_regenerate': not blocked_reason,
+            'blocked_reason': blocked_reason,
+            'suggested_issues': [i['issue_id'] for i in issues if i.get('severity') == '阻断级'],
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], url_path='regenerate')
+    def regenerate(self, request, task_id=None):
+        """
+        评审后用选中/全部评审意见重新生成用例（异步执行）。
+
+        与生成阶段的自动改进互补：这里可定向修、可重试、可回滚。
+        """
+        task = self.get_object()
+
+        serializer = RegenerateRequestSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        data = serializer.validated_data
+
+        # —— 前置校验 ——
+        active = TestCaseRevision.objects.filter(
+            task=task, status__in=['pending', 'generating', 'validating', 'reviewing']
+        ).first()
+        if active:
+            return Response(
+                {'error': f'第 {active.round} 轮修订尚未结束，请等待完成或先取消'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if task.status not in ('completed', 'revising'):
+            return Response(
+                {'error': f'任务当前状态为 {task.get_status_display()}，不支持修订'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if (task.current_round or 0) >= TestCaseGenerationTask.MAX_ROUNDS:
+            return Response(
+                {'error': f'已达 {TestCaseGenerationTask.MAX_ROUNDS} 轮修订上限，请人工介入'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        input_cases = task.final_test_cases or task.generated_test_cases
+        if not input_cases:
+            return Response({'error': '任务没有可修订的用例内容'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not task.review_feedback and not data.get('guidance'):
+            return Response(
+                {'error': '该任务没有评审意见，请在 guidance 中给出修订要求'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        writer_config = task.writer_model_config
+        if data.get('writer_model_config'):
+            writer_config = AIModelConfig.objects.filter(
+                id=data['writer_model_config'], is_active=True
+            ).first() or writer_config
+        if not writer_config:
+            return Response({'error': '未找到可用的编写模型配置'}, status=status.HTTP_400_BAD_REQUEST)
+
+        writer_prompt = task.writer_prompt_config
+        if data.get('writer_prompt_config'):
+            writer_prompt = PromptConfig.objects.filter(
+                id=data['writer_prompt_config']
+            ).first() or writer_prompt
+
+        # —— 建轮次 ——
+        max_round = TestCaseRevision.objects.filter(task=task).aggregate(
+            m=models.Max('round')
+        )['m'] or 0
+        target_issues = [str(i).upper() for i in data.get('target_issues') or []]
+        if data.get('scope') == 'all':
+            target_issues = []
+
+        # 有评审原文即视为评审驱动；否则是纯人工指导
+        source = 'review' if task.review_feedback else 'manual'
+
+        try:
+            revision = TestCaseRevision.objects.create(
+                task=task,
+                round=max_round + 1,
+                status='pending',
+                source=source,
+                input_cases=input_cases,
+                review_feedback=task.review_feedback or '',
+                target_issues=target_issues,
+                score_before=revision_service.compute_score_before(task),
+                writer_model_config=writer_config,
+                writer_prompt_config=writer_prompt,
+                created_by=request.user if request.user.is_authenticated else task.created_by,
+            )
+        except Exception as create_error:
+            logger.error(f"任务 {task.task_id} 创建修订轮次失败: {create_error}")
+            return Response(
+                {'error': f'创建修订轮次失败: {create_error}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        options = {
+            'max_retry': data.get('max_retry', 1),
+            'auto_review': data.get('auto_review', True),
+            'guidance': data.get('guidance', ''),
+        }
+
+        import threading
+        worker = threading.Thread(
+            target=revision_service.run_revision,
+            args=(revision.id, options),
+            name=f'revision-{task.task_id}-r{revision.round}',
+            daemon=True,
+        )
+        worker.start()
+
+        logger.info(
+            f"任务 {task.task_id} 启动第 {revision.round} 轮修订，"
+            f"target_issues={target_issues}, max_retry={options['max_retry']}, "
+            f"auto_review={options['auto_review']}"
+        )
+
+        return Response({
+            'revision_id': revision.id,
+            'round': revision.round,
+            'status': revision.status,
+            'target_issues': target_issues,
+        }, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['get'], url_path='revisions')
+    def revisions(self, request, task_id=None):
+        """修订轮次列表"""
+        task = self.get_object()
+        queryset = TestCaseRevision.objects.filter(task=task).order_by('round')
+        return Response({
+            'rounds': TestCaseRevisionSerializer(queryset, many=True).data,
+            'current_round': task.current_round or 0,
+            'max_rounds': TestCaseGenerationTask.MAX_ROUNDS,
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['get'], url_path=r'revisions/(?P<round>[0-9]+)')
+    def revision_detail(self, request, task_id=None, round=None):
+        """单个轮次详情（含输入/输出用例全文与校验明细）"""
+        task = self.get_object()
+        try:
+            revision = TestCaseRevision.objects.get(task=task, round=int(round))
+        except TestCaseRevision.DoesNotExist:
+            return Response({'error': f'第 {round} 轮修订不存在'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(
+            TestCaseRevisionDetailSerializer(revision).data,
+            status=status.HTTP_200_OK
+        )
+
+    @action(detail=True, methods=['get'], url_path=r'revisions/(?P<round>[0-9]+)/progress')
+    def revision_progress(self, request, task_id=None, round=None):
+        """轮询修订进度（含阶段，便于前端展示 生成中→校验中→评审中）"""
+        task = self.get_object()
+        try:
+            revision = TestCaseRevision.objects.get(task=task, round=int(round))
+        except TestCaseRevision.DoesNotExist:
+            return Response({'error': f'第 {round} 轮修订不存在'}, status=status.HTTP_404_NOT_FOUND)
+
+        return Response({
+            'round': revision.round,
+            'status': revision.status,
+            'phase': revision.phase,
+            'progress': revision.progress,
+            'validation_result': revision.validation_result,
+            'score_before': revision.score_before,
+            'score_after': revision.score_after,
+            'retry_count': revision.retry_count,
+            'error_message': revision.error_message,
+            'finished': revision.status in ('completed', 'needs_manual', 'failed', 'cancelled'),
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], url_path=r'revisions/(?P<round>[0-9]+)/rollback')
+    def rollback_revision(self, request, task_id=None, round=None):
+        """回滚到某一轮的输入版本"""
+        task = self.get_object()
+        try:
+            revision = TestCaseRevision.objects.get(task=task, round=int(round))
+        except TestCaseRevision.DoesNotExist:
+            return Response({'error': f'第 {round} 轮修订不存在'}, status=status.HTTP_404_NOT_FOUND)
+
+        if not revision.input_cases:
+            return Response({'error': '该轮没有可回滚的输入快照'}, status=status.HTTP_400_BAD_REQUEST)
+
+        task.final_test_cases = revision.input_cases
+        task.current_round = max(0, int(round) - 1)
+        if revision.score_before is not None:
+            task.latest_score = revision.score_before
+        task.save(update_fields=['final_test_cases', 'current_round', 'latest_score'])
+
+        logger.info(f"任务 {task.task_id} 已回滚到第 {round} 轮修订前的版本")
+
+        return Response({
+            'message': f'已回滚到第 {round} 轮修订前的版本',
+            'current_round': task.current_round,
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], url_path=r'revisions/(?P<round>[0-9]+)/revalidate')
+    def revalidate_revision(self, request, task_id=None, round=None):
+        """仅重跑结构校验，不调用模型（排查用，不消耗 token）"""
+        task = self.get_object()
+        try:
+            revision = TestCaseRevision.objects.get(task=task, round=int(round))
+        except TestCaseRevision.DoesNotExist:
+            return Response({'error': f'第 {round} 轮修订不存在'}, status=status.HTTP_404_NOT_FOUND)
+
+        text = revision.output_cases or task.final_test_cases
+        if not text:
+            return Response({'error': '没有可校验的内容'}, status=status.HTTP_400_BAD_REQUEST)
+
+        result = validate_case_table(text)
+        revision.validation_result = result
+        revision.save(update_fields=['validation_result'])
+        return Response(result, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['get'])
     def statistics(self, request):
